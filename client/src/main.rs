@@ -3,6 +3,7 @@ use std::{env, process};
 
 mod certificate;
 mod config;
+mod http;
 mod relay;
 mod socks5;
 
