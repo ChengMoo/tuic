@@ -6,7 +6,7 @@ use getopts::{Fail, Options};
 use log::{LevelFilter, ParseLevelError};
 use quinn::{
     congestion::{BbrConfig, CubicConfig, NewRenoConfig},
-    ClientConfig,
+    ClientConfig, TransportConfig,
 };
 use rustls::{version::TLS13, ClientConfig as RustlsClientConfig};
 use serde::{de::Error as DeError, Deserialize, Deserializer};
@@ -49,15 +49,22 @@ impl Config {
         unsafe { crate::FAST = raw.relay.fast_connect };
 
         let client_config = {
-            let certs = certificate::load_certificates(raw.relay.certificates)?;
-
-            let mut crypto = RustlsClientConfig::builder()
-                .with_safe_default_cipher_suites()
-                .with_safe_default_kx_groups()
-                .with_protocol_versions(&[&TLS13])
-                .unwrap()
-                .with_root_certificates(certs)
-                .with_no_client_auth();
+            let mut crypto = if raw.relay.insecure {
+                eprintln!("warning: insecure enabled");
+                RustlsClientConfig::builder()
+                    .with_safe_defaults()
+                    .with_custom_certificate_verifier(Arc::new(certificate::SkipVerify))
+                    .with_no_client_auth()
+            } else {
+                let certs = certificate::load_certificates(raw.relay.certificates)?;
+                RustlsClientConfig::builder()
+                    .with_safe_default_cipher_suites()
+                    .with_safe_default_kx_groups()
+                    .with_protocol_versions(&[&TLS13])
+                    .unwrap()
+                    .with_root_certificates(certs)
+                    .with_no_client_auth()
+            };
 
             crypto.alpn_protocols = raw
                 .relay
@@ -69,8 +76,7 @@ impl Config {
             crypto.enable_early_data = true;
             crypto.enable_sni = !raw.relay.disable_sni;
 
-            let mut config = ClientConfig::new(Arc::new(crypto));
-            let transport = Arc::get_mut(&mut config.transport).unwrap();
+            let mut transport = TransportConfig::default();
 
             match raw.relay.congestion_controller {
                 CongestionController::Bbr => {
@@ -85,7 +91,10 @@ impl Config {
             }
 
             transport.max_idle_timeout(None);
+            transport.max_concurrent_bidi_streams(0x10000u32.into());
 
+            let mut config = ClientConfig::new(Arc::new(crypto));
+            config.transport_config(transport.into());
             config
         };
 
@@ -160,6 +169,9 @@ struct RawRelayConfig {
     #[serde(default = "default::certificates")]
     certificates: Vec<String>,
 
+    #[serde(default)]
+    insecure: bool,
+
     #[serde(
         default = "default::udp_relay_mode",
         deserialize_with = "deserialize_from_str"
@@ -223,6 +235,7 @@ impl Default for RawRelayConfig {
             port: None,
             ip: None,
             token: None,
+            insecure: false,
             certificates: default::certificates(),
             udp_relay_mode: default::udp_relay_mode(),
             congestion_controller: default::congestion_controller(),
@@ -288,6 +301,8 @@ impl RawConfig {
             "Set custom X.509 certificate alongside native CA roots for the QUIC handshake. This option can be used multiple times to set multiple certificates",
             "CERTIFICATE",
         );
+
+        opts.optflag("", "insecure", "Skip certificate verification");
 
         opts.optopt(
             "",
@@ -466,6 +481,10 @@ impl RawConfig {
 
         if !certificates.is_empty() {
             raw.relay.certificates = certificates;
+        }
+
+        if matches.opt_present("insecure") {
+            raw.relay.insecure = true;
         }
 
         if let Some(mode) = matches.opt_str("udp-relay-mode") {
